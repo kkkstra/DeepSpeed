@@ -8,6 +8,7 @@ import json
 import pickle
 from typing import Iterable, Tuple
 
+from deepspeed.inference.v2.inference_utils import PrefixCacheStrategy
 import torch
 
 import deepspeed.comm as dist
@@ -105,6 +106,7 @@ class InferenceEngineV2:
         return dist.new_group(ranks=ranks)
 
     def put(self,
+            batch_sids: Iterable[str],
             batch_uids: Iterable[int],
             batch_tokens: Iterable[torch.Tensor],
             do_checks: bool = True) -> torch.Tensor:
@@ -114,6 +116,7 @@ class InferenceEngineV2:
         are not calculated.
 
         Arguments:
+            batch_sids: Iterable of sids for the batch on the host
             batch_uids: Iterable of uids for the batch on the host
             batch_tokens: Iterable of token tensors for the batch on the host
             do_checks: Check schedulability when it is set to True. You can skip this check for better performance when it has already been completed.
@@ -130,6 +133,12 @@ class InferenceEngineV2:
 
             host_seq_desc = self._state_manager.get_or_create_sequence(uid)
             self._model.maybe_allocate_kv(host_seq_desc, tokens.numel())
+
+            # before start forward, process the prefix kv first
+            if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
+                # Recompute the prefix cache, do nothing
+                pass
+
             host_seq_desc.pre_forward(tokens.numel())
 
             # We can disable checks since we already validated schedulability.

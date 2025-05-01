@@ -9,7 +9,7 @@ from typing import Tuple
 from pydantic import PositiveInt, model_validator
 
 from deepspeed.runtime.config_utils import DeepSpeedConfigModel
-from ..inference_utils import DtypeEnum
+from ..inference_utils import DtypeEnum, PrefixCacheStrategy
 
 
 class KVCacheType(Enum):
@@ -172,6 +172,8 @@ class DSStateManagerConfig(DeepSpeedConfigModel):
     """
     Enable tracking for offloading KV-cache to host memory. Currently unsupported.
     """
+
+    prefix_cache_strategy: PrefixCacheStrategy = PrefixCacheStrategy.RECOMP
 
     @model_validator(mode="after")
     def max_ragged_sequence_count_validator(self):

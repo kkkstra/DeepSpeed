@@ -77,6 +77,14 @@ class ActivationType(IntEnum):
 
     InvalidType = -1
 
+class PrefixCacheStrategy(IntEnum):
+    """
+    Types of prefix cache strategies supported by DS-Inference
+    """
+
+    RECOMP = 0
+    KV_OFFLOAD = 1
+    H_CACHE = 2
 
 def is_gated(act_fn: ActivationType) -> bool:
     """
