@@ -3,7 +3,7 @@
 
 # DeepSpeed Team
 
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -76,6 +76,9 @@ class RaggedBatchWrapper:
     then accessing the Nth cache will require accessing the Nth block id
     """
 
+    _session_ids: List[str]
+    _kv_block_ids: List[torch.Tensor]
+
     def __init__(self, config: DSStateManagerConfig) -> None:
         """
         Convenience wrapper around the data structures used to represent a ragged
@@ -119,6 +122,8 @@ class RaggedBatchWrapper:
         self._inflight_seq_descriptors_shadow_buf = []
         self._kv_blocks_ptr_buf = []
         self._token_to_seq_storage_shadow_buf = []
+        self._session_ids = []
+        self._kv_block_ids = []
 
     def clear(self) -> None:
         """
@@ -130,6 +135,8 @@ class RaggedBatchWrapper:
         self._inflight_seq_descriptors_shadow_buf = []
         self._kv_blocks_ptr_buf = []
         self._token_to_seq_storage_shadow_buf = []
+        self._session_ids = []
+        self._kv_block_ids = []
 
     def insert_sequence(self, seq_descriptor: DSSequenceDescriptor, tokens: torch.Tensor, do_checks=True) -> None:
         """
@@ -168,6 +175,9 @@ class RaggedBatchWrapper:
 
         self._current_tokens += seq_tokens
         self._current_sequences += 1
+
+        self._session_ids.append(seq_descriptor._session_id)
+        self._kv_block_ids.append(seq_descriptor.all_block_ids())
 
     @property
     def tensor_toks(self) -> torch.Tensor:
@@ -274,6 +284,18 @@ class RaggedBatchWrapper:
         Models that will need this will be BERT-like, not generative.
         """
         return None
+
+    def session_ids(self) -> List[str]:
+        """
+        The session ids associated with the sequences in the ragged batch.
+        """
+        return self._session_ids
+
+    def kv_block_ids(self) -> List[torch.Tensor]:
+        """
+        The kv block ids associated with the sequences in the ragged batch.
+        """
+        return self._kv_block_ids
 
     @property
     def current_tokens(self) -> int:

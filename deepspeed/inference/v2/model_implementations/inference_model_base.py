@@ -6,6 +6,7 @@
 from abc import ABC, abstractmethod
 from typing import Iterable, Optional, Tuple, Type
 
+from deepspeed.inference.v2.ragged.prefix_cache_manager import PrefixCacheManager
 import torch
 
 import deepspeed.comm as dist
@@ -83,6 +84,8 @@ class DSInferenceModelBase(torch.nn.Module, ABC):
     until full initialization.
     """
 
+    prefix_cache_manager: Optional[PrefixCacheManager]
+
     def __init__(self, config: DSModelImplementationConfig, engine_config: RaggedInferenceEngineConfig,
                  base_mp_group: MPType) -> None:
         """
@@ -129,6 +132,13 @@ class DSInferenceModelBase(torch.nn.Module, ABC):
         the model is fully initialized.
         """
         self.state_manager = state_manager
+
+    def set_prefix_cache_manager(self, prefix_cache_manager: PrefixCacheManager):
+        """
+        Sets the prefix cache manager attribute. This is called by the inference engine after
+        the model is fully initialized.
+        """
+        self.prefix_cache_manager = prefix_cache_manager
 
     @cached_property
     def tp_rank(self) -> int:

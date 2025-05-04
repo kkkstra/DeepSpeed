@@ -9,6 +9,7 @@ import pickle
 from typing import Iterable, Tuple
 
 from deepspeed.inference.v2.inference_utils import PrefixCacheStrategy
+from deepspeed.inference.v2.ragged.prefix_cache_manager import PrefixCacheManager
 import torch
 
 import deepspeed.comm as dist
@@ -43,6 +44,11 @@ class InferenceEngineV2:
     _state_manager: DSStateManager
     """
     Persistent state manager for sequences and KV-cache.
+    """
+
+    _prefix_cache_manager: PrefixCacheManager
+    """
+    Prefix cache manager for managing prefix cache.
     """
 
     @property
@@ -91,6 +97,13 @@ class InferenceEngineV2:
                                              base_mp_group=self._base_mp_group)
         self._model.set_state_manager(self._state_manager)
 
+        # Create prefix cache manager
+        self._prefix_cache_manager = PrefixCacheManager(
+            self._config.state_manager.prefix_cache_strategy,
+            self._state_manager,
+        )
+        self._model.set_prefix_cache_manager(self._prefix_cache_manager)
+
     def _initialize_tp_group(self):
         """
         Implementation of our TP group initialization.
@@ -129,20 +142,25 @@ class InferenceEngineV2:
                 raise SchedulingError(schedule_check)
 
         self._batch.clear()
-        for uid, tokens in zip(batch_uids, batch_tokens):
+        for sid, uid, tokens in zip(batch_sids, batch_uids, batch_tokens):
 
-            host_seq_desc = self._state_manager.get_or_create_sequence(uid)
+            host_seq_desc = self._state_manager.get_or_create_sequence(uid, sid)
             self._model.maybe_allocate_kv(host_seq_desc, tokens.numel())
 
             # before start forward, process the prefix kv first
-            if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
-                # Recompute the prefix cache, do nothing
-                pass
-
-            host_seq_desc.pre_forward(tokens.numel())
+            load_tokens = 0
+            if host_seq_desc.seen_tokens == 0:
+                if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
+                    # Recompute the prefix cache, do nothing
+                    pass
+                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
+                    load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc)
+                    print(f"load {load_tokens} prefix tokens for {sid=} {uid=}")
+                    
+            host_seq_desc.pre_forward(tokens.numel() - load_tokens)
 
             # We can disable checks since we already validated schedulability.
-            self._batch.insert_sequence(host_seq_desc, tokens, do_checks=do_checks)
+            self._batch.insert_sequence(host_seq_desc, tokens[load_tokens:], do_checks=do_checks)
 
         # Send all metadata to the device
         self._batch.finalize()

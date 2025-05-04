@@ -129,7 +129,7 @@ class DSStateManager:
         """
         return self._seqs.get(uid, None)
 
-    def get_or_create_sequence(self, uid: int) -> DSSequenceDescriptor:
+    def get_or_create_sequence(self, uid: int, sid: str=None) -> DSSequenceDescriptor:
         """
         Get the existing sequence descriptor for a given uid or initialize one if
         it does not exist. NOTE: This will always return a valid sequence descriptor
@@ -140,9 +140,9 @@ class DSStateManager:
         if seq is not None:
             return seq
         else:
-            return self._create_sequence(uid)
+            return self._create_sequence(uid, sid)
 
-    def _create_sequence(self, uid: int) -> DSSequenceDescriptor:
+    def _create_sequence(self, uid: int, sid: str=None) -> DSSequenceDescriptor:
         """
         Create a new sequence descriptor for the given sequence id.
         """
@@ -162,7 +162,8 @@ class DSStateManager:
         self._seqs[uid] = DSSequenceDescriptor(tracking_slot,
                                                seq_block_ids,
                                                seq_block_ids_shadow,
-                                               max_context=self._config.max_context)
+                                               max_context=self._config.max_context,
+                                               session_id=sid)
         # TODO(cmikeh2): Debug call here might be unnecessary and is potentially on critical path.
         logger.debug(f"Created sequence {uid} with tracking slot {tracking_slot}.")
         return self._seqs[uid]

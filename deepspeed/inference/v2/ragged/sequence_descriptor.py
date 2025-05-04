@@ -58,6 +58,11 @@ class PlaceholderSequenceDescriptor(BaseSequenceDescriptor):
 
 class DSSequenceDescriptor(BaseSequenceDescriptor):
 
+    _session_id: str
+    """
+    The session ID for the sequence. This is used to track the session in the system.
+    """
+
     _seen_tokens: int
     """
     Number of tokens in the sequence that have completed a forward pass.
@@ -99,7 +104,8 @@ class DSSequenceDescriptor(BaseSequenceDescriptor):
                  tracking_id: int,
                  kv_cache_ids: Tuple[torch.Tensor, ...],
                  kv_cache_ids_shadow: Tuple[torch.Tensor, ...],
-                 max_context: int = -1) -> None:
+                 max_context: int = -1,
+                 session_id: str=None) -> None:
         """
         Create the metadata to track a single sequence in the system.
 
@@ -114,6 +120,7 @@ class DSSequenceDescriptor(BaseSequenceDescriptor):
             max_context (int): The maximum number of tokens this sequence may eventually include.
                 Currently unused but may be used in future implementations for speculative caching.
         """
+        self._session_id = session_id
         self._tracking_id = tracking_id
         self._kv_cache_ids = kv_cache_ids
         self._kv_cache_ids_shadow = kv_cache_ids_shadow
@@ -145,6 +152,13 @@ class DSSequenceDescriptor(BaseSequenceDescriptor):
         Number of tokens that have begun a forward pass but not yet completed it.
         """
         return self._in_flight_tokens
+
+    @property
+    def session_id(self) -> str:
+        """
+        The session ID for the sequence. This is used to track the session in the system.
+        """
+        return self._session_id
 
     @property
     def max_context(self) -> int:

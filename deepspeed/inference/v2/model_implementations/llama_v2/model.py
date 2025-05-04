@@ -5,12 +5,13 @@
 
 from typing import Iterable, Optional, Tuple
 
+from deepspeed.inference.v2.ragged.prefix_cache_manager import PrefixCacheManager
 import torch
 
 import deepspeed.comm as dist
 
 from ...allocator import empty_from
-from ...inference_utils import ActivationType, DtypeEnum
+from ...inference_utils import ActivationType, DtypeEnum, PrefixCacheStrategy
 from .. import *
 from ...modules.configs import *
 from ...modules.interfaces import *
@@ -150,6 +151,11 @@ class Llama2InferenceModel(DSTransformerModelBase):
 
         hidden_states = self.qkv(hidden_states, cur_params.qkv_w, b=None)
         hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
+
+        # offload the KV-cache to the host
+        if self._engine_config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
+            self.prefix_cache_manager.offload_kv_cache(layer_idx, kv_cache, ragged_batch_info, self.kv_cache_config())
+
         hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w, b=None)
 
         if self.tp_size > 1:
