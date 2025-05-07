@@ -178,3 +178,13 @@ class DSDenseBlockedAttention(DSSelfAttentionBase):
         self._attn_kernel(output, q, k_cache, v_cache, self._atoms[:self._cur_atoms], self._softmax_scale)
 
         return output
+
+    def kv_copy(self,
+                kv_cache: torch.Tensor,
+                q_k_v: torch.Tensor,
+                batch: RaggedBatchWrapper,
+                inv_freqs: Optional[torch.Tensor] = None):
+        if inv_freqs is not None:
+            self._kv_copy(kv_cache, q_k_v, batch, inv_freqs)
+        else:
+            self._kv_copy(kv_cache, q_k_v, batch)

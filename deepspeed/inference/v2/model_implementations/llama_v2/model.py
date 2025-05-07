@@ -209,7 +209,19 @@ class Llama2InferenceModel(DSTransformerModelBase):
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
 
         for layer_idx in range(self.num_layers):
+            # offload hidden states to the host
+            if self._engine_config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
+                self.prefix_cache_manager.offload_h_cache(layer_idx, hidden_states, wrapped_batch,
+                                                            self.kv_cache_config())
+                
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
                                                                       wrapped_batch)
 
         return self._forward_unembed(residual, wrapped_batch)
+
+    def kv_copy(self,
+                kv_cache: torch.Tensor,
+                q_k_v: torch.Tensor,
+                batch: RaggedBatchWrapper,
+                inv_freqs: Optional[torch.Tensor] = None):
+        self.attn.kv_copy(kv_cache, q_k_v, batch, inv_freqs)

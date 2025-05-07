@@ -155,7 +155,10 @@ class InferenceEngineV2:
                     pass
                 elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
                     load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc)
-                    print(f"load {load_tokens} prefix tokens for {sid=} {uid=}")
+                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
+                    load_tokens = self._prefix_cache_manager.load_h_cache(self._model, tokens, host_seq_desc)
+
+                print(f"load {load_tokens} prefix tokens for {sid=} {uid=}")
                     
             host_seq_desc.pre_forward(tokens.numel() - load_tokens)
 
