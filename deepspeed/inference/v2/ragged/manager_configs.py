@@ -174,6 +174,7 @@ class DSStateManagerConfig(DeepSpeedConfigModel):
     """
 
     prefix_cache_strategy: PrefixCacheStrategy = PrefixCacheStrategy.RECOMP
+    prefix_cache_strategy_alt: PrefixCacheStrategy = PrefixCacheStrategy.RECOMP
 
     @model_validator(mode="after")
     def max_ragged_sequence_count_validator(self):

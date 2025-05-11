@@ -3,7 +3,8 @@
 
 # DeepSpeed Team
 
-from typing import Iterable, Optional, Tuple
+import asyncio
+from typing import Iterable, List, Optional, Tuple
 
 from deepspeed.inference.v2.ragged.prefix_cache_manager import PrefixCacheManager
 import torch
@@ -132,7 +133,8 @@ class Llama2InferenceModel(DSTransformerModelBase):
         return embed
 
     def _forward_transformer_layer(self, layer_idx: int, residual: torch.Tensor, hidden_states: torch.Tensor,
-                                   ragged_batch_info: RaggedBatchWrapper) -> Tuple[torch.Tensor, torch.Tensor]:
+                                   ragged_batch_info: RaggedBatchWrapper,
+                                   loop: asyncio.AbstractEventLoop=None, offload_tasks: List[asyncio.Task]=None, enable_offload: bool=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Executes one (slightly offset) layer of the transformer. This implementation does a peak-ahead
         optimization to fuse the layer norm of the next layer into the current layer.
@@ -153,8 +155,12 @@ class Llama2InferenceModel(DSTransformerModelBase):
         hidden_states = self.attn(hidden_states, kv_cache, ragged_batch_info)
 
         # offload the KV-cache to the host
-        if self._engine_config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
-            self.prefix_cache_manager.offload_kv_cache(layer_idx, kv_cache, ragged_batch_info, self.kv_cache_config())
+        if enable_offload and self.prefix_cache_manager.select_cache_strategy(layer_idx) == PrefixCacheStrategy.KV_OFFLOAD:
+            offload_tasks.append(
+                loop.create_task(
+                    self.prefix_cache_manager.offload_kv_cache(layer_idx, kv_cache, ragged_batch_info, self.kv_cache_config())
+                )
+            )
 
         hidden_states = self.attn_out(hidden_states, cur_params.attn_out_w, b=None)
 
@@ -208,16 +214,29 @@ class Llama2InferenceModel(DSTransformerModelBase):
 
         residual, hidden_states = self.norm(residual, None, self._transformer[0].attn_norm_gamma, beta=None)
 
+        offload_tasks = []
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
         for layer_idx in range(self.num_layers):
             # offload hidden states to the host
-            if self._engine_config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
+            if self.prefix_cache_manager.select_cache_strategy(layer_idx) == PrefixCacheStrategy.H_CACHE:
                 self.prefix_cache_manager.offload_h_cache(layer_idx, hidden_states, wrapped_batch,
                                                             self.kv_cache_config())
                 
             residual, hidden_states = self._forward_transformer_layer(layer_idx, residual, hidden_states,
-                                                                      wrapped_batch)
+                                                                      wrapped_batch,
+                                                                      loop, offload_tasks, True)
 
-        return self._forward_unembed(residual, wrapped_batch)
+        logits = self._forward_unembed(residual, wrapped_batch)
+
+        if offload_tasks:
+            try:
+                loop.run_until_complete(asyncio.gather(*offload_tasks))
+            finally:
+                loop.close()
+        
+        return logits
 
     def kv_copy(self,
                 kv_cache: torch.Tensor,

@@ -6,6 +6,7 @@
 import os
 import json
 import pickle
+import time
 from typing import Iterable, Tuple
 
 from deepspeed.inference.v2.inference_utils import PrefixCacheStrategy
@@ -100,6 +101,7 @@ class InferenceEngineV2:
         # Create prefix cache manager
         self._prefix_cache_manager = PrefixCacheManager(
             self._config.state_manager.prefix_cache_strategy,
+            self._config.state_manager.prefix_cache_strategy_alt,
             self._state_manager,
         )
         self._model.set_prefix_cache_manager(self._prefix_cache_manager)
@@ -149,16 +151,18 @@ class InferenceEngineV2:
 
             # before start forward, process the prefix kv first
             load_tokens = 0
-            if host_seq_desc.seen_tokens == 0:
-                if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
-                    # Recompute the prefix cache, do nothing
-                    pass
-                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
-                    load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc)
-                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
-                    load_tokens = self._prefix_cache_manager.load_h_cache(self._model, tokens, host_seq_desc)
+            start_time = time.perf_counter()
+            if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
+                # Recompute the prefix cache, do nothing
+                pass
+            elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
+                load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc, tokens)
+            elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
+                load_tokens = self._prefix_cache_manager.load_h_cache(self._model, tokens, host_seq_desc)
+            end_time = time.perf_counter()
 
-                print(f"load {load_tokens} prefix tokens for {sid=} {uid=}")
+            if load_tokens > 0:
+                print(f"load {load_tokens}/{tokens.numel()} prefix tokens for {sid=} {uid=}, cost {(end_time - start_time) * 1000:.2f} ms")
                     
             host_seq_desc.pre_forward(tokens.numel() - load_tokens)
 
