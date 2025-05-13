@@ -102,6 +102,7 @@ class InferenceEngineV2:
         self._prefix_cache_manager = PrefixCacheManager(
             self._config.state_manager.prefix_cache_strategy,
             self._config.state_manager.prefix_cache_strategy_alt,
+            self._config.state_manager.h_cache_layer,
             self._state_manager,
         )
         self._model.set_prefix_cache_manager(self._prefix_cache_manager)
@@ -124,6 +125,7 @@ class InferenceEngineV2:
             batch_sids: Iterable[str],
             batch_uids: Iterable[int],
             batch_tokens: Iterable[torch.Tensor],
+            prefix_lengths: Iterable[int],
             do_checks: bool = True) -> torch.Tensor:
         """
         Put a ragged batch onto the inference engine. This will perform one forward and return
@@ -144,26 +146,28 @@ class InferenceEngineV2:
                 raise SchedulingError(schedule_check)
 
         self._batch.clear()
-        for sid, uid, tokens in zip(batch_sids, batch_uids, batch_tokens):
+        for sid, uid, tokens, prefix_length in zip(batch_sids, batch_uids, batch_tokens, prefix_lengths):
 
             host_seq_desc = self._state_manager.get_or_create_sequence(uid, sid)
             self._model.maybe_allocate_kv(host_seq_desc, tokens.numel())
 
             # before start forward, process the prefix kv first
             load_tokens = 0
-            start_time = time.perf_counter()
-            if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
-                # Recompute the prefix cache, do nothing
-                pass
-            elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
-                load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc, tokens)
-            elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
-                load_tokens = self._prefix_cache_manager.load_h_cache(self._model, tokens, host_seq_desc)
-            end_time = time.perf_counter()
+            if tokens.numel() > 1:
+                start_time = time.perf_counter()
+                if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
+                    # Recompute the prefix cache, do nothing
+                    pass
+                    # load_tokens = self._prefix_cache_manager.recompute_kv_cache(self._model, tokens, host_seq_desc, prefix_length)
+                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
+                    load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc, tokens)
+                elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
+                    load_tokens = self._prefix_cache_manager.load_h_cache(self._model, tokens, host_seq_desc)
+                end_time = time.perf_counter()
 
             if load_tokens > 0:
                 print(f"load {load_tokens}/{tokens.numel()} prefix tokens for {sid=} {uid=}, cost {(end_time - start_time) * 1000:.2f} ms")
-                    
+            
             host_seq_desc.pre_forward(tokens.numel() - load_tokens)
 
             # We can disable checks since we already validated schedulability.
@@ -175,6 +179,9 @@ class InferenceEngineV2:
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
         self._model.prepare_batch(self._batch)
+
+        # ensure all prefix cache is loaded
+        torch.cuda.synchronize()
 
         # Model implementation will pick up in the forward.
         logits = self._model.forward(self._batch)

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any, Dict, List, Optional, Tuple
 from deepspeed.accelerator.real_accelerator import get_accelerator
 from deepspeed.inference.v2.inference_utils import PrefixCacheStrategy
@@ -14,20 +15,24 @@ class PrefixCacheManager:
         self,
         cache_strategy: PrefixCacheStrategy,
         alternate_cache_strategy: PrefixCacheStrategy,
+        layer: int,
         state_manager: DSStateManager,
     ):
         self.cache_strategy = cache_strategy
         self.alternate_cache_strategy = alternate_cache_strategy
-        self.h_cache_layer = 30
+        self.h_cache_layer = layer
         self.num_layers = state_manager._kv_configs[0].cache_shape[0]
 
-        print(f"cache strategy: {self.cache_strategy}, alternate cache strategy: {self.alternate_cache_strategy}")
+        self.chunk_size = state_manager._kv_configs[0].block_size
+
+        print(f"cache strategy: {self.cache_strategy}, alternate cache strategy: {self.alternate_cache_strategy}, h_cache layer: {self.h_cache_layer}")
 
         self.state_manager = state_manager
 
         # session_id => cache
         self.cahce_map: Dict[str, List[List[torch.Tensor]]] = {}
         self.cache_type_map: Dict[str, List[PrefixCacheStrategy]] = {}
+        self.cache_tokens: Dict[str, List[int]] = {}
 
     def select_cache_strategy(
         self,
@@ -65,6 +70,7 @@ class PrefixCacheManager:
                 for _ in range(num_layers):
                     self.cahce_map[session_id].append([])
                 self.cache_type_map[session_id] = [PrefixCacheStrategy.RECOMP] * num_layers
+                self.cache_tokens[session_id] = [0] * num_layers
             self.cache_type_map[session_id][layer_idx] = PrefixCacheStrategy.KV_OFFLOAD
 
             token_start, inflight_tokens, seen_tokens, _ = inflight_seq_descriptor
@@ -73,14 +79,24 @@ class PrefixCacheManager:
                 token_idx = seen_tokens + i
                 block_idx = block_ids[token_idx // kv_cache_config.block_size]
                 block_offset = token_idx % kv_cache_config.block_size
-                # print(f"{block_idx=} {block_offset=} {kv_cache.shape=} {kv_cache[block_idx, block_offset].shape=}")
-                host_kv = torch.zeros(
-                    (2, num_heads, head_size),
-                    dtype=kv_cache.dtype,
-                    device="cpu",
-                ).copy_(kv_cache[block_idx, block_offset])
+                
+                chunk_idx = self.cache_tokens[session_id][layer_idx] // self.chunk_size
+                chunk_offset = self.cache_tokens[session_id][layer_idx] % self.chunk_size
+                self.cache_tokens[session_id][layer_idx] += 1
 
-                self.cahce_map[session_id][layer_idx].append(host_kv)
+                if chunk_offset == 0:
+                    host_kv_chunk = torch.zeros(
+                        (self.chunk_size, 2, num_heads, head_size),
+                        dtype=kv_cache.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self.cahce_map[session_id][layer_idx].append(host_kv_chunk)
+
+                host_kv = self.cahce_map[session_id][layer_idx][chunk_idx][chunk_offset]
+                host_kv.copy_(kv_cache[block_idx, block_offset],
+                            #   non_blocking=True,
+                )
     
     def offload_h_cache(
         self,
@@ -89,6 +105,7 @@ class PrefixCacheManager:
         ragged_batch_info: RaggedBatchWrapper,
         kv_cache_configs: Tuple[KVCacheConfig, ...]
     ):
+        # print(f"start offload h cache for layer {layer_idx}")
         kv_cache_config = kv_cache_configs[0]
         num_layers = kv_cache_config.cache_shape[0]
         num_heads = kv_cache_config.cache_shape[1]
@@ -103,18 +120,32 @@ class PrefixCacheManager:
                 for _ in range(num_layers):
                     self.cahce_map[session_id].append([])
                 self.cache_type_map[session_id] = [PrefixCacheStrategy.RECOMP] * num_layers
+                self.cache_tokens[session_id] = [0] * num_layers
             self.cache_type_map[session_id][layer_idx] = PrefixCacheStrategy.H_CACHE
 
             token_start, inflight_tokens, seen_tokens, _ = inflight_seq_descriptor
             for i in range(inflight_tokens):
-                host_hidden_states = torch.zeros(
-                    (num_heads * head_size),
-                    dtype=hidden_states.dtype,
-                    device="cpu",
-                ).copy_(hidden_states[i])
 
-                self.cahce_map[session_id][layer_idx].append(host_hidden_states)
-            # print(f"offload h cache for layer {layer_idx} of session {session_id}, inflight_tokens {inflight_tokens}, {len(self.cahce_map[session_id][layer_idx])=}")
+                chunk_idx = self.cache_tokens[session_id][layer_idx] // self.chunk_size
+                chunk_offset = self.cache_tokens[session_id][layer_idx] % self.chunk_size
+                self.cache_tokens[session_id][layer_idx] += 1
+
+                if chunk_offset == 0:
+                    host_h_chunk = torch.zeros(
+                        (self.chunk_size, num_heads * head_size),
+                        dtype=hidden_states.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    self.cahce_map[session_id][layer_idx].append(host_h_chunk)
+
+                host_h_cache = self.cahce_map[session_id][layer_idx][chunk_idx][chunk_offset]
+                host_h_cache.copy_(hidden_states[token_start + i],
+                                #    non_blocking=True,
+                )
+        
+        # torch.cuda.synchronize()
+        # print(f"finish offload h cache for layer {layer_idx}")
 
     def load_kv_cache(
         self,
@@ -130,7 +161,7 @@ class PrefixCacheManager:
         
         # assert num_layers == len(self.cahce_map[session_id]), f"num_layers {num_layers} != {len(self.cahce_map[session_id])}"
 
-        prefix_tokens = min(len(self.cahce_map[session_id][0]) - host_seq_desc.seen_tokens, tokens.numel()-1)
+        prefix_tokens = min(self.cache_tokens[session_id][0] - host_seq_desc.seen_tokens, tokens.numel()-1)
         if prefix_tokens <= 0:
             return 0
 
@@ -147,14 +178,22 @@ class PrefixCacheManager:
             kv_cache = self.state_manager.get_cache(layer_idx)
             prefix_cache = self.cahce_map[session_id][layer_idx]
 
-            for idx, kv in enumerate(prefix_cache[host_seq_desc.seen_tokens:host_seq_desc.seen_tokens + prefix_tokens]):
-                token_idx = idx + host_seq_desc.seen_tokens
+            for idx in range(prefix_tokens):
+                token_idx = host_seq_desc.seen_tokens + idx
                 block_idx = block_ids[token_idx // block_size]
                 block_offset = token_idx % block_size
-                kv_cache[block_idx, block_offset].copy_(kv, non_blocking=True)
+
+                chunk_idx = token_idx // self.chunk_size
+                chunk_offset = token_idx % self.chunk_size
+
+                kv = prefix_cache[chunk_idx][chunk_offset]
+                kv_cache[block_idx, block_offset].copy_(kv,
+                                          non_blocking=True,
+                )
 
         host_seq_desc.post_forward()
 
+        # torch.cuda.synchronize()
         return prefix_tokens
 
     async def recompute_h_cache_layer(
@@ -212,7 +251,7 @@ class PrefixCacheManager:
         num_heads = kv_cache_config.cache_shape[1]
         head_size = kv_cache_config.cache_shape[2]
 
-        total_num_tokens = min(len(self.cahce_map[session_id][-1]) - host_seq_desc.seen_tokens, tokens.numel()-1)
+        total_num_tokens = min(self.cache_tokens[session_id][-1] - host_seq_desc.seen_tokens, tokens.numel()-1)
         if total_num_tokens <= 0:
             return 0
 
@@ -221,19 +260,21 @@ class PrefixCacheManager:
 
         load_tokens = 0
 
+        recompute_tasks = []
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         while load_tokens < total_num_tokens:
             num_tokens = min(total_num_tokens - load_tokens, 512)
 
             host_seq_desc.pre_forward(num_tokens)
 
             batch = RaggedBatchWrapper(self.state_manager._config)
-            batch.insert_sequence(host_seq_desc, tokens[:num_tokens])
+            batch.insert_sequence(host_seq_desc, tokens[load_tokens:load_tokens + num_tokens])
             batch.finalize()
 
-            recompute_tasks = []
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
 
+            # start_time = time.perf_counter()
             for layer_idx in range(num_layers):
                 cache_type = self.cache_type_map[session_id][layer_idx]
                 # assert cache_type == PrefixCacheStrategy.RECOMP or num_tokens == len(self.cahce_map[session_id][layer_idx]), \
@@ -253,16 +294,28 @@ class PrefixCacheManager:
                     kv_cache = self.state_manager.get_cache(layer_idx)
                     prefix_cache = self.cahce_map[session_id][layer_idx]
 
-                    for idx, kv in enumerate(prefix_cache[host_seq_desc.seen_tokens:host_seq_desc.seen_tokens + num_tokens]):
+                    for idx in range(num_tokens):
                         token_idx = host_seq_desc.seen_tokens + idx
                         block_idx = block_ids[token_idx // block_size]
                         block_offset = token_idx % block_size
-                        kv_cache[block_idx, block_offset].copy_(kv)
+
+                        chunk_idx = token_idx // self.chunk_size
+                        chunk_offset = token_idx % self.chunk_size
+
+                        kv = prefix_cache[chunk_idx][chunk_offset]
+                        kv_cache[block_idx, block_offset].copy_(kv,
+                                                                non_blocking=True,
+                        )
                     
                 elif cache_type == PrefixCacheStrategy.H_CACHE:
-                    # print(f"recompute hcache layer {layer_idx} of session {session_id}")
-                    host_hidden_states = self.cahce_map[session_id][layer_idx][host_seq_desc.seen_tokens:host_seq_desc.seen_tokens + num_tokens]
+                    # print(f"load hcache layer {layer_idx} of session {session_id}")
+                    host_hidden_states = self.cahce_map[session_id][layer_idx]
                     kv_cache = self.state_manager.get_cache(layer_idx)
+
+                    chunk_idx_start = host_seq_desc.seen_tokens // self.chunk_size
+                    chunk_start_offset = host_seq_desc.seen_tokens % self.chunk_size
+                    chunk_idx_end = (host_seq_desc.seen_tokens + num_tokens) // self.chunk_size
+                    chunk_length = chunk_idx_end - chunk_idx_start 
 
                     hidden_states = torch.zeros(
                         (num_tokens, num_heads * head_size),
@@ -271,17 +324,77 @@ class PrefixCacheManager:
                     )
 
                     # copy all hidden states cache to device
-                    hidden_states.copy_(torch.stack(host_hidden_states))
+                    if chunk_length == 0:
+                        hidden_states.copy_(
+                                    host_hidden_states[chunk_idx_start][chunk_start_offset:chunk_start_offset + num_tokens],
+                                    non_blocking=True,
+                                )
+                    else:
+                        for chunk_idx in range(chunk_length):
+                            # print(f"{hidden_states[chunk_idx * self.chunk_size: (chunk_idx + 1) * self.chunk_size].shape=}, {host_hidden_states[chunk_idx].shape=}")
+                            if chunk_idx == 0:
+                                hidden_states[chunk_idx * self.chunk_size: (chunk_idx + 1) * self.chunk_size - chunk_start_offset].copy_(
+                                    host_hidden_states[chunk_idx_start + chunk_idx][chunk_start_offset:],
+                                    non_blocking=True,
+                                )
+                            else:
+                                hidden_states[chunk_idx * self.chunk_size - chunk_start_offset: (chunk_idx + 1) * self.chunk_size - chunk_start_offset].copy_(
+                                    host_hidden_states[chunk_idx_start + chunk_idx],
+                                    non_blocking=True,
+                                )
+                        if chunk_length * self.chunk_size - chunk_start_offset < num_tokens:
+                            # print(f"{chunk_length=}, {self.chunk_size=}, {host_seq_desc.seen_tokens=}, {num_tokens=}, {chunk_start_offset=}, {chunk_idx_start=}, {chunk_idx_end=}")
+                            hidden_states[chunk_length * self.chunk_size - chunk_start_offset: num_tokens].copy_(
+                                host_hidden_states[chunk_idx_end][0: num_tokens - chunk_length * self.chunk_size + chunk_start_offset],
+                                non_blocking=True,
+                            )
 
                     # recompute hidden states
                     recompute_tasks.append(
                         loop.create_task(self.recompute_h_cache_layer(layer_idx, model, hidden_states, kv_cache, batch))
                     )
+            # end_time = time.perf_counter()
+            # print(f"load {num_tokens} tokens hidden states took {end_time - start_time:.4f} seconds")
+
+            # torch.cuda.synchronize()
             
-            try:
-                loop.run_until_complete(asyncio.gather(*recompute_tasks))
-            finally:
-                loop.close()
+            host_seq_desc.post_forward()
+            load_tokens += num_tokens
+        try:
+            loop.run_until_complete(asyncio.gather(*recompute_tasks))
+        finally:
+            loop.close()
+
+        return total_num_tokens
+    
+    def recompute_kv_cache(
+        self,
+        model,
+        tokens: torch.Tensor,
+        host_seq_desc: DSSequenceDescriptor,
+        prefix_length: int,
+    ) -> int:
+        from deepspeed.inference.v2.model_implementations.inference_model_base import DSInferenceModelBase
+        model: DSInferenceModelBase = model
+
+        total_num_tokens = min(prefix_length - host_seq_desc.seen_tokens, tokens.numel()-1)
+        if total_num_tokens <= 0:
+            return 0
+
+        batch = RaggedBatchWrapper(self.state_manager._config)
+
+        load_tokens = 0
+        while load_tokens < total_num_tokens:
+            num_tokens = min(total_num_tokens - load_tokens, 512)
+
+            host_seq_desc.pre_forward(num_tokens)
+
+            batch.clear()
+            batch.insert_sequence(host_seq_desc, tokens[load_tokens:load_tokens + num_tokens])
+            batch.finalize()
+
+            model.prepare_batch(batch)
+            model.forward(batch)
             
             host_seq_desc.post_forward()
             load_tokens += num_tokens

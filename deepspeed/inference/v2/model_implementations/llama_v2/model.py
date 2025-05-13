@@ -230,6 +230,7 @@ class Llama2InferenceModel(DSTransformerModelBase):
 
         logits = self._forward_unembed(residual, wrapped_batch)
 
+        # torch.cuda.synchronize()
         if offload_tasks:
             try:
                 loop.run_until_complete(asyncio.gather(*offload_tasks))
