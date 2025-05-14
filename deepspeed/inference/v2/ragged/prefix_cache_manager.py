@@ -381,7 +381,9 @@ class PrefixCacheManager:
         if total_num_tokens <= 0:
             return 0
 
-        batch = RaggedBatchWrapper(self.state_manager._config)
+        recompute_tasks = []
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
         load_tokens = 0
         while load_tokens < total_num_tokens:
@@ -389,14 +391,22 @@ class PrefixCacheManager:
 
             host_seq_desc.pre_forward(num_tokens)
 
-            batch.clear()
+            batch = RaggedBatchWrapper(self.state_manager._config)
             batch.insert_sequence(host_seq_desc, tokens[load_tokens:load_tokens + num_tokens])
             batch.finalize()
 
             model.prepare_batch(batch)
-            model.forward(batch)
+            recompute_tasks.append(
+                loop.create_task( self.recompute_layer(self.num_layers, model, batch) )
+            )
+            # model.forward(batch)
             
             host_seq_desc.post_forward()
             load_tokens += num_tokens
+
+        try:
+            loop.run_until_complete(asyncio.gather(*recompute_tasks))
+        finally:
+            loop.close()
 
         return total_num_tokens

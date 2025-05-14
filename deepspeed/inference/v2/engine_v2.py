@@ -156,9 +156,7 @@ class InferenceEngineV2:
             if tokens.numel() > 1:
                 start_time = time.perf_counter()
                 if self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.RECOMP:
-                    # Recompute the prefix cache, do nothing
-                    pass
-                    # load_tokens = self._prefix_cache_manager.recompute_kv_cache(self._model, tokens, host_seq_desc, prefix_length)
+                    load_tokens = self._prefix_cache_manager.recompute_kv_cache(self._model, tokens, host_seq_desc, prefix_length)
                 elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.KV_OFFLOAD:
                     load_tokens = self._prefix_cache_manager.load_kv_cache(self._model.num_layers, host_seq_desc, tokens)
                 elif self._config.state_manager.prefix_cache_strategy == PrefixCacheStrategy.H_CACHE:
@@ -176,12 +174,12 @@ class InferenceEngineV2:
         # Send all metadata to the device
         self._batch.finalize()
 
+        # ensure all prefix cache is loaded
+        torch.cuda.synchronize()
+
         # Prep all data structures for the actual forward (in anticipation of CG in the future)
         # and also to amortize some of the costs in a more straightforward way.
         self._model.prepare_batch(self._batch)
-
-        # ensure all prefix cache is loaded
-        torch.cuda.synchronize()
 
         # Model implementation will pick up in the forward.
         logits = self._model.forward(self._batch)
